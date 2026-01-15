@@ -1,8 +1,8 @@
 import argparse
+import json
 import os
 import re
 import time
-import sys
 from PIL import Image
 from google import genai
 from google.genai import types
@@ -14,7 +14,7 @@ RUN: python run.py original_pdf_file_to_transcribe.pdf
 # Models mapped to a shorthand (used as args and appended to results files)
 MODELS = {
     '25fl': 'gemini-2.5-flash-lite', # cheap and adequate at OCR but bad at following instructions, 10 RPM 20 RPD
-    '25f': 'gemini-2.5-flash', # cheapish, ???, 5 RPM 20 RPD
+    '25f': 'gemini-2.5-flash', # cheapish, a bit better than the lite, 5 RPM 20 RPD
     '25p': 'gemini-2.5-pro', # pricey, got a 429 so maybe I can't use it
     '3fp': 'gemini-3-flash-preview', # cheapish, 5 RPM 20 RPD
     #'3pp': 'gemini-3-pro-preview' # I don't get this in the free tier
@@ -51,7 +51,7 @@ def transcribe_batch(pdf_path, pages_file="", model="", skip_letters=[], verbose
 
     if not os.path.exists(pdf_path):
         print(f"Cannot find input file {pdf_path}")
-        sys.exit(1)
+        return
 
     # TODO it's a little awkward to take the PDF path given that we do nothing with it
     # relying on the preprocessing script but we could add preprocessing here later I suppose
@@ -65,7 +65,7 @@ def transcribe_batch(pdf_path, pages_file="", model="", skip_letters=[], verbose
         # The initialization could be theoretically done in this script,
         # but it's in a bash script for now for easier manual use
         print(f"Project not correctly initialized; {image_dir} and {pages_file} must both exist")
-        sys.exit(1)
+        return
 
     with open(SYSTEM_INSTRUCTION_FILE, 'r') as f:
         system_instructions = f.read()
@@ -96,7 +96,7 @@ def transcribe_batch(pdf_path, pages_file="", model="", skip_letters=[], verbose
                 content_items.append(img)
             else:
                 print(f"Warning: File {file_name} not found. Exiting.")
-                sys.exit(1)
+                return
         content_items.append(USER_PROMPT.format(pages))
 
         # TRANSCRIBE PAGES
@@ -110,22 +110,17 @@ def transcribe_batch(pdf_path, pages_file="", model="", skip_letters=[], verbose
                 )
             )
 
-            # SOME LOGGING
-            if verbose:
-                # Accessing usage metadata
-                usage = response.usage_metadata
-                print(f"Prompt Tokens: {usage.prompt_token_count}")
-                print(f"Candidates Tokens: {usage.candidates_token_count}")
-                print(f"Total Tokens: {usage.total_token_count}")
-                # Accessing the model's internal reasoning (if available)
-                for part in response.candidates[0].content.parts:
-                    if part.thought:
-                        # Could consider saving these to file
-                        print(f"MODEL REASONING: {part.text}")
-                # Check if the response was flagged
-                if response.candidates[0].finish_reason == "SAFETY":
-                    print("Warning: Content was blocked by safety filters.")
+            # Log full response if there's an issue
+            # Just checking candidates for now because that's one issue I had
+            if not response.candidates:
+                json_data = response.model_dump_json()
+                pretty_json = json.dumps(json.loads(json_data), indent=2)
+                if verbose:
+                    print(f"FULL RESPONSE: {pretty_json}")
+                print("Error: No candidates returned. The request may have been blocked or failed.")
+                return
 
+            # Write file (maybe should be done before the candidates check)
             safe_name = '_'.join([f"{num:02d}" for num in pages])
             output_path = os.path.join(output_dir, f"ocr_{model_key}_pages_{safe_name}.md")
 
@@ -134,14 +129,34 @@ def transcribe_batch(pdf_path, pages_file="", model="", skip_letters=[], verbose
             end_time = time.time()
             print(f"Successfully saved transcribed letter {i} with pages {pages}. Total time: {end_time - start_time:.2f} seconds")
 
+            # Some logging
+            if verbose:
+                # Accessing usage metadata
+                usage = response.usage_metadata
+                print(f"Prompt Tokens: {usage.prompt_token_count}")
+                print(f"Candidates Tokens: {usage.candidates_token_count}")
+                print(f"Total Tokens: {usage.total_token_count}")
+
+                # Accessing the model's internal reasoning (if available)
+                # (checked that candidates exists already above)
+                for part in response.candidates[0].content.parts:
+                    if part.thought:
+                        # Could consider saving these to file
+                        print(f"MODEL REASONING: {part.text}")
+                # Check if the response was flagged
+                if response.candidates[0].finish_reason == "SAFETY":
+                    print("Warning: Content was blocked by safety filters.")
+
+
         except Exception as e:
             print(f"Exception: {e}")
             print(f"Error transcribing letter {i} with pages {pages}. Exiting.")
             # we'll exit here so it's obvious that something was missed, but consider continuing
             # also could gracefully handle rate limit errors (429) specifically by sleeping
-            sys.exit(1)
+            return
 
         # RATE LIMIT AVOIDANCE
+        # TODO this should be variable by model
         time.sleep(COOLDOWN)
 
 if __name__ == "__main__":
